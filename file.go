@@ -8,65 +8,57 @@ import (
 	"time"
 )
 
-type asyncLogType struct {
-	files map[string]*LogFile
-
-	sync.RWMutex
-}
-
 type LogFile struct {
 	filename string
-	flag     int    //log.LstdFlags
+	flag     int //default log.LstdFlags
 
 	sync struct {
-		frequency  time.Duration
-		beginTime time.Time
-		status    syncStatus
+		frequency time.Duration
+		status    int
 	}
 
 	level int
 
 	cache struct {
-		enable  bool
-		data []string
-
-		mutex sync.Mutex
+		enable bool
+		data   []string
+		mutex  sync.Mutex
 	}
 
-	logRotate struct {
-		rotate LogRotate
-		file   *os.File
-		suffix string
-		mutex  sync.Mutex
+	rotate struct {
+		enable     bool
+		rotateType int
+		mutex      sync.Mutex
 	}
 }
 
-type syncStatus int
+type AsyncFilesMap struct {
+	files map[string]*LogFile
+	sync.RWMutex
+}
 
 const (
-	statusInit  syncStatus = iota
-	statusDoing
-	statusDone
+	SyncInit  = iota
+	SyncDoing
+	SyncDone
 )
 
-type LogRotate int
-
 const (
-	RotateHour LogRotate = iota
+	RotateHour = iota
 	RotateDate
 )
 
 const (
+	RotateHourFormat = "2006010215"
+	RotateDateFormat = "20060102"
+)
+
+const (
 	logTimeFormat string = "2006-01-02 15:04:05"
-
-	fileOpenMode = 0666
-
-	fileFlag = os.O_WRONLY | os.O_CREATE | os.O_APPEND
-
-	newlineStr  = "\n"
-	newlineChar = '\n'
-
-	cacheInitCap = 128
+	fileOpenMode         = 0666
+	fileFlag             = os.O_WRONLY | os.O_CREATE | os.O_APPEND
+	newlineStr           = "\n"
+	cacheInitCap         = 1024
 )
 
 const (
@@ -74,12 +66,12 @@ const (
 	StdFlag = log.LstdFlags
 )
 
-var asyncLog *asyncLogType
+var asyncFiles *AsyncFilesMap
 
 var nowFunc = time.Now
 
 func init() {
-	asyncLog = &asyncLogType{
+	asyncFiles = &AsyncFilesMap{
 		files: make(map[string]*LogFile),
 	}
 
@@ -89,14 +81,13 @@ func init() {
 		for {
 			select {
 			case <-timer.C:
-				//now := nowFunc()
-				asyncLog.RLock()
-				for _, file := range asyncLog.files {
-					if file.sync.status != statusDoing {
+				asyncFiles.RLock()
+				for _, file := range asyncFiles.files {
+					if file.sync.status != SyncDoing {
 						go file.Flush()
 					}
 				}
-				asyncLog.RUnlock()
+				asyncFiles.RUnlock()
 			}
 		}
 
@@ -104,10 +95,10 @@ func init() {
 }
 
 func NewFileLogger(filename string) *LogFile {
-	asyncLog.Lock()
-	defer asyncLog.Unlock()
+	asyncFiles.Lock()
+	defer asyncFiles.Unlock()
 
-	if lf, ok := asyncLog.files[filename]; ok {
+	if lf, ok := asyncFiles.files[filename]; ok {
 		return lf
 	}
 
@@ -116,30 +107,20 @@ func NewFileLogger(filename string) *LogFile {
 		flag:     StdFlag,
 	}
 
-	asyncLog.files[filename] = lf
-
-	lf.logRotate.rotate = RotateDate
-
+	asyncFiles.files[filename] = lf
+	lf.rotate.enable = true
+	lf.rotate.rotateType = RotateDate
 	lf.cache.enable = true
-
-	lf.sync.frequency = time.Second
 
 	return lf
 }
 
-
 // save to file
 func (lf *LogFile) Flush() error {
-	lf.sync.status = statusDoing
+	lf.sync.status = SyncDoing
 	defer func() {
-		lf.sync.status = statusDone
+		lf.sync.status = SyncDone
 	}()
-
-	file, err := lf.openFileNoCache()
-	if err != nil {
-		panic(err)
-	}
-	defer file.Close()
 
 	lf.cache.mutex.Lock()
 	cache := lf.cache.data
@@ -150,21 +131,21 @@ func (lf *LogFile) Flush() error {
 		return nil
 	}
 
-	for i := 1; i <= 3; i++ {
-		_, err = file.WriteString(strings.Join(cache, ""))
-		if err != nil {
-			if i == 3 {
-				panic(err)
-			}
+	lf.rotate.mutex.Lock()
+	defer lf.rotate.mutex.Unlock()
+	file, err := lf.openFile()
+	if err != nil {
+		panic(err)
+	}
+	defer file.Close()
 
-		}
-		break
+	_, err = file.WriteString(strings.Join(cache, ""))
+	if err != nil {
+		panic(err)
 	}
 
 	return nil
 }
-
-//================== private functions =======================
 
 func (lf *LogFile) write(msg string) error {
 	if lf.flag == StdFlag {
@@ -187,62 +168,44 @@ func (lf *LogFile) appendCache(msg string) {
 	lf.cache.mutex.Unlock()
 }
 
-func (lf *LogFile) getFilenameSuffix() string {
-	if lf.logRotate.rotate == RotateDate {
-		return nowFunc().Format("20060102")
-	}
-	return nowFunc().Format("2006010215")
-}
-
 func (lf *LogFile) directWrite(msg []byte) error {
+	lf.rotate.mutex.Lock()
+	defer lf.rotate.mutex.Unlock()
 	file, err := lf.openFile()
-	//file, err := lf.openFileNoCache()
 	if err != nil {
 		panic(err)
 	}
 	defer file.Close()
 
-	lf.logRotate.mutex.Lock()
 	_, err = file.Write(msg)
-	lf.logRotate.mutex.Unlock()
-
 	return err
 }
 
-func (lf *LogFile) openFile() (*os.File, error) {
-	suffix := lf.getFilenameSuffix()
-
-	lf.logRotate.mutex.Lock()
-	defer lf.logRotate.mutex.Unlock()
-
-	if suffix == lf.logRotate.suffix {
-		return lf.logRotate.file, nil
+func (lf *LogFile) getFilename(filename string) string {
+	if lf.rotate.enable == false {
+		return filename
 	}
 
-	logFilename := lf.filename + "." + suffix
+	var suffix string
+	if lf.rotate.rotateType == RotateDate {
+		suffix = nowFunc().Format(RotateDateFormat)
+	} else {
+		suffix = nowFunc().Format(RotateHourFormat)
+	}
+	arr := strings.Split(filename, ".")
+	l := len(arr)
+	if l <= 1 {
+		return filename + "." + suffix
+	} else {
+		return strings.Join(arr[:l-1], "") + "." + suffix + "." + strings.Join(arr[l-1:], "");
+	}
+}
+
+func (lf *LogFile) openFile() (*os.File, error) {
+	logFilename := lf.getFilename(lf.filename)
 	file, err := os.OpenFile(logFilename, fileFlag, fileOpenMode)
 	if err != nil {
 		panic(err)
-	}
-
-	if lf.logRotate.file != nil {
-		lf.logRotate.file.Close()
-	}
-
-	lf.logRotate.file = file
-	lf.logRotate.suffix = suffix
-	return file, nil
-}
-
-func (lf *LogFile) openFileNoCache() (*os.File, error) {
-	logFilename := lf.filename + "." + lf.getFilenameSuffix()
-
-	lf.logRotate.mutex.Lock()
-	defer lf.logRotate.mutex.Unlock()
-
-	file, err := os.OpenFile(logFilename, fileFlag, fileOpenMode)
-	if err != nil {
-		return file, err
 	}
 
 	return file, nil
